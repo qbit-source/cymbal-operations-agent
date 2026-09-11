@@ -72,7 +72,11 @@ def start_server() -> subprocess.Popen[str]:
     ]
     env = os.environ.copy()
     env["INTEGRATION_TEST"] = "TRUE"
+    # Ensure headless VM runners and sandbox environments resolve gracefully
     env["USE_MOCK_LLM"] = os.environ.get("USE_MOCK_LLM", "TRUE")
+    env["GEMINI_API_KEY"] = os.environ.get("GEMINI_API_KEY", "dummy-gemini-test-key")
+    env["GOOGLE_API_KEY"] = os.environ.get("GOOGLE_API_KEY", "dummy-google-test-key")
+    env["GOOGLE_CLOUD_PROJECT"] = os.environ.get("PROJECT_ID", "cymbal-retail-test-project")
     # Advertise a loopback URL so the A2A client can reach the card's transport.
     env["APP_URL"] = BASE_URL
     process = subprocess.Popen(
@@ -240,6 +244,7 @@ def test_collect_feedback(server_fixture: subprocess.Popen[str]) -> None:
         FEEDBACK_URL, json=feedback_data, headers=HEADERS, timeout=10
     )
     assert response.status_code == 200
+    assert response.json().get("status") == "success"
 
 
 def test_reasoning_engine_stream(server_fixture: subprocess.Popen[str]) -> None:
