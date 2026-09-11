@@ -9,11 +9,20 @@ from typing import Any, Dict, List, Optional
 import google.auth
 from google.cloud import bigquery
 
+from app.app_utils.pii import mask_card_pii
+
 logger = logging.getLogger(__name__)
 
-PROJECT_ID = os.getenv("PROJECT_ID", "project-elevate-503005")
-CHUNK_TABLE = f"{PROJECT_ID}.cymbal_gold.pos_manual_chunk_embeddings"
+PROJECT_ID = os.getenv("PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT", "project-elevate-503005"))
+DATASET_ID = os.getenv("CYMBAL_GOLD_DATASET", "cymbal_gold")
+CHUNK_TABLE = f"{PROJECT_ID}.{DATASET_ID}.pos_manual_chunk_embeddings"
 SIMILARITY_THRESHOLD = 0.70
+
+MANDATORY_DECLINE_STRING = (
+    "The requested issue falls outside certified POS equipment manuals (relevance score < 0.70). "
+    "No certified technical runbook was found for this query. "
+    "Please consult store operations or verified technical documentation."
+)
 
 
 def _gcs_to_https(gcs_uri: str) -> str:
@@ -49,6 +58,7 @@ def pos_troubleshooting_rag_tool(query: str) -> str:
         The verified diagnostic procedure, adjacent runbook steps, FRU recommendations,
         and certified clickable documentation link from Cloud Storage.
     """
+    sanitized_query = mask_card_pii(query)
     client = bigquery.Client(project=PROJECT_ID)
     max_retries = 3
     base_delay = 1.0
@@ -89,7 +99,7 @@ def pos_troubleshooting_rag_tool(query: str) -> str:
         try:
             job_config = bigquery.QueryJobConfig(
                 query_parameters=[
-                    bigquery.ScalarQueryParameter("user_query", "STRING", query)
+                    bigquery.ScalarQueryParameter("user_query", "STRING", sanitized_query)
                 ]
             )
             query_job = client.query(vector_sql, job_config=job_config)
@@ -105,7 +115,7 @@ def pos_troubleshooting_rag_tool(query: str) -> str:
 
                 # If score meets certified threshold, return procedure
                 if similarity >= SIMILARITY_THRESHOLD:
-                    return (
+                    response_text = (
                         f"### Verified POS Hardware Diagnostic Runbook\n\n"
                         f"- **Equipment:** {equipment}\n"
                         f"- **Manual:** [{title}]({doc_url})\n"
@@ -114,6 +124,7 @@ def pos_troubleshooting_rag_tool(query: str) -> str:
                         f"{runbook}\n\n"
                         f"📄 **Certified Documentation Link:** [{doc_url}]({doc_url})"
                     )
+                    return mask_card_pii(response_text)
 
             # If vector score was below threshold or no vector rows, proceed to fallback check
             break
@@ -125,7 +136,7 @@ def pos_troubleshooting_rag_tool(query: str) -> str:
                 return f"Notice: BigQuery vector search service is temporarily unreachable: {e}"
 
     # 2. Secondary Full-Text SEARCH Fallback for specific Error Codes
-    error_code = _extract_error_code(query)
+    error_code = _extract_error_code(sanitized_query)
     if error_code:
         fallback_sql = f"""
         WITH match AS (
@@ -161,7 +172,7 @@ def pos_troubleshooting_rag_tool(query: str) -> str:
             if fb_rows:
                 fb_row = fb_rows[0]
                 doc_url = _gcs_to_https(fb_row.source_pdf_uri)
-                return (
+                response_text = (
                     f"### Verified POS Hardware Diagnostic Runbook (Exact Code Match)\n\n"
                     f"- **Error Code:** `{error_code}`\n"
                     f"- **Equipment:** {fb_row.equipment_covered}\n"
@@ -170,13 +181,9 @@ def pos_troubleshooting_rag_tool(query: str) -> str:
                     f"{fb_row.stitched_runbook}\n\n"
                     f"📄 **Certified Documentation Link:** [{doc_url}]({doc_url})"
                 )
+                return mask_card_pii(response_text)
         except Exception as e:
             logger.warning(f"Full text search fallback failed: {e}")
 
-    # 3. Certified Safety Warning for Out-of-Scope Inquiries
-    return (
-        "⚠️ **Safety Warning / Out of Scope:** The requested issue does not match certified "
-        "in-store POS hardware equipment manuals (relevance score < 0.70). "
-        "No certified technical runbook was found for this query. "
-        "Please consult store operations or verified technical documentation."
-    )
+    # 3. Certified Standard Decline String for Out-of-Scope / Sub-0.70 Inquiries
+    return MANDATORY_DECLINE_STRING

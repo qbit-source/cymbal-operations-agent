@@ -1,40 +1,48 @@
-"""Bigtable MCP Toolset implementation for Cymbal Operations Agent.
+"""Bigtable MCP Toolset and Analytical Connectors for Cymbal Operations Agent.
 
 Queries Cloud Bigtable instance 'operations-db' via deployed MCP Toolbox microservice on Cloud Run,
-with resilient decoding for binary metrics and direct Bigtable fallback.
+Bigtable GoogleSQL query executor, and direct SDK row set fallback.
 """
 
-import os
-import json
 import base64
-import struct
+import json
 import logging
-from typing import Any, Dict, List, Optional
+import os
+import struct
 import subprocess
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from google.adk.tools import FunctionTool
 from google.cloud import bigtable
+from google.cloud.bigtable.data import BigtableDataClient
 from google.cloud.bigtable.row_set import RowSet
+
+from app.app_utils.pii import mask_card_pii, mask_data_structures
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ID = os.getenv("PROJECT_ID", "project-elevate-503005")
+PROJECT_ID = os.getenv("PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT", "project-elevate-503005"))
 BIGTABLE_INSTANCE_ID = os.getenv("BIGTABLE_INSTANCE_ID", "operations-db")
 BIGTABLE_TABLE_ID = os.getenv("BIGTABLE_TABLE_ID", "cashier_realtime_alerts")
+BIGTABLE_ENRICHED_TABLE_ID = os.getenv("BIGTABLE_ENRICHED_TABLE_ID", "pos_transactions_enriched")
 BIGTABLE_MCP_URL = os.getenv("BIGTABLE_MCP_URL", "https://mcp-toolbox-bigtable-519629786311.us-central1.run.app")
+SERVICE_ACCOUNT = os.getenv(
+    "SERVICE_ACCOUNT",
+    f"cymbal-sa-data@{PROJECT_ID}.iam.gserviceaccount.com" if PROJECT_ID else "",
+)
 
 _bigtable_client: Optional[bigtable.Client] = None
 
 
-def _get_bigtable_table():
+def _get_bigtable_table(table_name: str = BIGTABLE_TABLE_ID):
     global _bigtable_client
     if _bigtable_client is None:
         _bigtable_client = bigtable.Client(project=PROJECT_ID)
     instance = _bigtable_client.instance(BIGTABLE_INSTANCE_ID)
-    return instance.table(BIGTABLE_TABLE_ID)
+    return instance.table(table_name)
 
 
 def _decode_metric_bytes(col_name: str, raw_bytes: bytes) -> Any:
@@ -58,14 +66,17 @@ def _decode_metric_bytes(col_name: str, raw_bytes: bytes) -> Any:
         ):
             return round(struct.unpack(">d", raw_bytes)[0], 4)
     try:
-        return raw_bytes.decode("utf-8")
+        val_str = raw_bytes.decode("utf-8")
+        if val_str.startswith('"') and val_str.endswith('"'):
+            val_str = json.loads(val_str)
+        return val_str
     except Exception:
         return str(raw_bytes)
 
 
 def _query_bigtable_direct(prefix: str, limit: int = 5) -> List[Dict[str, Any]]:
     """Direct fallback query using Bigtable SDK with row set prefix scanning."""
-    table = _get_bigtable_table()
+    table = _get_bigtable_table(BIGTABLE_TABLE_ID)
     row_set = RowSet()
     row_set.add_row_range_with_prefix(prefix)
     rows = table.read_rows(row_set=row_set, limit=limit)
@@ -84,14 +95,12 @@ def _query_bigtable_direct(prefix: str, limit: int = 5) -> List[Dict[str, Any]]:
 def _get_oidc_token(audience: str) -> Optional[str]:
     """Generates GCP OIDC identity token for target audience."""
     try:
+        cmd = ["gcloud", "auth", "print-identity-token"]
+        if SERVICE_ACCOUNT:
+            cmd.append(f"--impersonate-service-account={SERVICE_ACCOUNT}")
+        cmd.append(f"--audiences={audience}")
         token = subprocess.check_output(
-            [
-                "gcloud",
-                "auth",
-                "print-identity-token",
-                f"--impersonate-service-account=cymbal-sa-data@{PROJECT_ID}.iam.gserviceaccount.com",
-                f"--audiences={audience}",
-            ],
+            cmd,
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=10,
@@ -209,7 +218,7 @@ def query_cashier_realtime_alerts(
             })
 
         latest_record = rows[0]
-        return json.dumps({
+        result_payload = {
             "status": "SUCCESS",
             "store_id": norm_store,
             "cashier_id": clean_cashier,
@@ -225,7 +234,8 @@ def query_cashier_realtime_alerts(
                 "risk_score": latest_record.get("risk_score"),
             },
             "history_rows_scanned": len(rows),
-        }, indent=2)
+        }
+        return json.dumps(mask_data_structures(result_payload), indent=2)
 
     except Exception as e:
         logger.error(f"Error querying Bigtable cashier alerts: {e}", exc_info=True)
@@ -235,5 +245,125 @@ def query_cashier_realtime_alerts(
         })
 
 
+def read_pos_transactions_enriched_sql(
+    store_id: str,
+    transaction_id: str = "",
+    limit: int = 5,
+) -> str:
+    """Queries enriched point-of-sale transactions from Cloud Bigtable 'pos_transactions_enriched' table using GoogleSQL.
+
+    Use this analytical sub-tool to inspect:
+    - Enriched line-item details, card brands, POS terminal IDs, totals, and discounts.
+    - Transaction breakdown for a specific store or transaction ID in Cloud Bigtable.
+    - PII-masked payment methods and audit details.
+
+    Args:
+        store_id: Store identifier, e.g. 'STORE_048' or '48' or 'STORE_001'.
+        transaction_id: Optional specific transaction ID, e.g. 'TXN-20260910-0000715'.
+        limit: Maximum number of enriched transactions to return (default: 5, max: 20).
+
+    Returns:
+        JSON string containing list of enriched transaction records with payment PII masked.
+    """
+    clean_store = store_id.strip().upper()
+    if clean_store.startswith("STORE_"):
+        clean_store = clean_store.replace("STORE_", "")
+    clean_store = clean_store.zfill(3)
+    norm_store = f"STORE_{clean_store}"
+
+    clamped_limit = max(1, min(limit, 20))
+    clean_tx = transaction_id.strip().upper()
+
+    if clean_tx:
+        exact_row_key = f"{norm_store}#{clean_tx}"
+        sql_query = f"""
+        SELECT _key, tx
+        FROM {BIGTABLE_ENRICHED_TABLE_ID}
+        WHERE _key = b'{exact_row_key}'
+        LIMIT {clamped_limit}
+        """
+    else:
+        prefix_start = f"{norm_store}#"
+        prefix_end = f"{norm_store}$\uffff"
+        sql_query = f"""
+        SELECT _key, tx
+        FROM {BIGTABLE_ENRICHED_TABLE_ID}
+        WHERE _key >= b'{prefix_start}' AND _key < b'{prefix_end}'
+        LIMIT {clamped_limit}
+        """
+
+    records: List[Dict[str, Any]] = []
+
+    # Attempt 1: Bigtable Data Client with GoogleSQL execute_query
+    try:
+        with BigtableDataClient(project=PROJECT_ID) as client:
+            res = client.execute_query(
+                instance_id=BIGTABLE_INSTANCE_ID,
+                app_profile_id="default",
+                query=sql_query,
+            )
+            for row in res:
+                row_fields = dict(row._fields)
+                raw_key = row_fields.get("_key", b"")
+                row_key_str = raw_key.decode("utf-8", errors="replace") if isinstance(raw_key, bytes) else str(raw_key)
+
+                tx_map = row_fields.get("tx", {})
+                record: Dict[str, Any] = {"row_key": row_key_str}
+                if isinstance(tx_map, dict):
+                    for col_b, val_b in tx_map.items():
+                        col_name = col_b.decode("utf-8") if isinstance(col_b, bytes) else str(col_b)
+                        val_str = val_b.decode("utf-8", errors="replace") if isinstance(val_b, bytes) else str(val_b)
+                        try:
+                            if (val_str.startswith("{") and val_str.endswith("}")) or (val_str.startswith("[") and val_str.endswith("]")):
+                                record[col_name] = json.loads(val_str)
+                            elif val_str.startswith('"') and val_str.endswith('"'):
+                                record[col_name] = json.loads(val_str)
+                            else:
+                                record[col_name] = val_str
+                        except Exception:
+                            record[col_name] = val_str
+                records.append(record)
+    except Exception as sql_err:
+        logger.warning(f"Bigtable execute_query SQL failed ({sql_err}), falling back to direct SDK prefix scan.")
+        try:
+            table = _get_bigtable_table(BIGTABLE_ENRICHED_TABLE_ID)
+            row_set = RowSet()
+            if clean_tx:
+                row_set.add_row_key(f"{norm_store}#{clean_tx}".encode("utf-8"))
+            else:
+                row_set.add_row_range_with_prefix(f"{norm_store}#".encode("utf-8"))
+            rows = table.read_rows(row_set=row_set, limit=clamped_limit)
+            for row in rows:
+                record = {"row_key": row.row_key.decode("utf-8", errors="replace")}
+                for fam, cols in row.cells.items():
+                    for col, cells in cols.items():
+                        col_name = col.decode("utf-8")
+                        raw_val = cells[0].value
+                        record[col_name] = _decode_metric_bytes(col_name, raw_val)
+                records.append(record)
+        except Exception as direct_err:
+            logger.error(f"Direct Bigtable fallback also failed: {direct_err}", exc_info=True)
+            return json.dumps({
+                "status": "ERROR",
+                "message": f"Failed to retrieve enriched transactions from Bigtable: {str(direct_err)}",
+            })
+
+    if not records:
+        return json.dumps({
+            "status": "NOT_FOUND",
+            "message": f"No enriched transactions found for {norm_store} (query: {clean_tx or 'ALL'}).",
+            "store_id": norm_store,
+        })
+
+    result_payload = {
+        "status": "SUCCESS",
+        "store_id": norm_store,
+        "records_count": len(records),
+        "transactions": records,
+    }
+    return json.dumps(mask_data_structures(result_payload), indent=2)
+
+
 bigtable_realtime_alerts_tool = FunctionTool(query_cashier_realtime_alerts)
+bigtable_enriched_sql_tool = FunctionTool(read_pos_transactions_enriched_sql)
 bigtable_mcp_toolset = bigtable_realtime_alerts_tool

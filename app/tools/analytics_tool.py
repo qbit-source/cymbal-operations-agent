@@ -14,11 +14,15 @@ from google.adk.tools.data_agent.data_agent_tool import (
     ask_data_agent,
 )
 
+from app.app_utils.pii import mask_card_pii
+
 logger = logging.getLogger(__name__)
 
+PROJECT_ID = os.getenv("PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT", "project-elevate-503005"))
+DATA_AGENT_ID = os.getenv("DATA_AGENT_ID", "cymbal-retail-analytics-data-agent")
 DATA_AGENT_RESOURCE_NAME = os.getenv(
     "DATA_AGENT_RESOURCE_NAME",
-    "projects/project-elevate-503005/locations/global/dataAgents/cymbal-retail-analytics-data-agent",
+    f"projects/{PROJECT_ID}/locations/global/dataAgents/{DATA_AGENT_ID}",
 )
 
 
@@ -69,8 +73,8 @@ def _format_data_agent_response(response_steps: List[Dict[str, Any]]) -> str:
     if not output_sections:
         return "Query completed successfully, but no data records were returned matching the criteria."
 
-    return "\n\n".join(output_sections)
-
+    full_output = "\n\n".join(output_sections)
+    return mask_card_pii(full_output)
 
 
 def cymbal_analytics_tool(query: str) -> str:
@@ -91,6 +95,7 @@ def cymbal_analytics_tool(query: str) -> str:
     Returns:
         A formatted string containing the generated SQL, query result data summary, and analysis.
     """
+    sanitized_query = mask_card_pii(query)
     max_retries = 3
     base_delay = 1.0
 
@@ -104,7 +109,7 @@ def cymbal_analytics_tool(query: str) -> str:
 
             result = ask_data_agent(
                 data_agent_name=DATA_AGENT_RESOURCE_NAME,
-                query=query,
+                query=sanitized_query,
                 credentials=creds,
                 settings=config,
                 tool_context=None,
