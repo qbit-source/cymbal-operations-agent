@@ -31,7 +31,13 @@ from app.app_utils.pii_plugin import PiiRedactionPlugin
 
 logger = logging.getLogger(__name__)
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+
+# Detect mock/sandbox mode for isolated testing without live Gemini dependencies
+USE_MOCK_LLM = (
+    os.getenv("USE_MOCK_LLM", "").lower() in ("true", "1", "yes")
+    or os.getenv("INTEGRATION_TEST_MOCK", "").lower() in ("true", "1", "yes")
+)
 
 SYSTEM_INSTRUCTION = """You are the Cymbal Operations Coordinator Agent (cymbal_operations_agent), an enterprise operational intelligence assistant for store directors, regional operations leads, and retail compliance auditors.
 
@@ -44,7 +50,7 @@ You have access to 4 specialized tools:
    - Technical hardware runbook and field recovery engine for POS terminals, EMV contactless readers, receipt printers, cash drawers, and peripherals.
    - Powered by BigQuery vector similarity search with adjacent context window stitching over certified OEM technical manuals.
    - Always provides certified GCS HTTPS documentation links.
-   - When an inquiry falls outside certified equipment manuals or score < 0.70, it declines cleanly with the certified safety warning.
+   - When an inquiry falls outside certified equipment manuals or score < 0.70, it declines cleanly with: "I cannot find certified warranty or repair rules for this specific error in our technical repository."
 3. `query_cashier_realtime_alerts` (or `bigtable_mcp_toolset`):
    - Real-time sub-second operational telemetry engine querying Cloud Bigtable instance 'operations-db'.
    - Use to inspect live 1-hour rolling metrics (transaction count, manual override count, promo count, promo rate, average discount percentage, total discount USD, risk score) and live audit status flags for a cashier at a specific store.
@@ -95,12 +101,19 @@ if project_id and telemetry_dataset:
     except Exception as bq_err:
         logger.warning(f"Could not initialize BigQueryAgentAnalyticsPlugin: {bq_err}")
 
+if USE_MOCK_LLM:
+    from app.app_utils.mock_llm import MockLlm
+    agent_model = MockLlm()
+    logger.info("Initialized agent with MockLlm for isolated/offline testing.")
+else:
+    agent_model = Gemini(
+        model=MODEL_NAME,
+        retry_options=types.HttpRetryOptions(attempts=3),
+    )
+
 cymbal_operations_agent = Agent(
     name="cymbal_operations_agent",
-    model=Gemini(
-        model=MODEL,
-        retry_options=types.HttpRetryOptions(attempts=3),
-    ),
+    model=agent_model,
     instruction=SYSTEM_INSTRUCTION,
     tools=[
         cymbal_analytics_tool,

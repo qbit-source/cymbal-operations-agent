@@ -1,0 +1,142 @@
+{
+  "eval_cases": [
+    {
+      "eval_case_id": "eval_multiturn_crosscloud_audit_workflow",
+      "description": "Multi-turn evaluation: Turn 1 identifies top promo abuse offenders; Turn 2 pulls federated AWS S3 logs.",
+      "agent_data": {
+        "turns": [
+          {
+            "turn_index": 0,
+            "events": [
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Show cashiers with active cashier promo abuse alerts in the last 7 days."
+                    }
+                  ]
+                }
+              },
+              {
+                "author": "agent",
+                "content": {
+                  "role": "model",
+                  "parts": [
+                    {
+                      "text": "Based on BigQuery pos_anomaly_alerts for the past 7 days, Cashier CASH_1190 at Store 48 has the highest promo override rate (42.5%) with 18 anomaly flags."
+                    }
+                  ]
+                }
+              },
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Retrieve the federated AWS S3 checkout transaction logs for CASH_1190 at Store 48 to inspect the applied promo codes."
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "eval_multiturn_warranty_triage_flow",
+      "description": "Multi-turn evaluation: Turn 1 checks transaction line items; Turn 2 assesses warranty terms for the item.",
+      "agent_data": {
+        "turns": [
+          {
+            "turn_index": 0,
+            "events": [
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Check transaction details for TXN-20260312-0015811."
+                    }
+                  ]
+                }
+              },
+              {
+                "author": "agent",
+                "content": {
+                  "role": "model",
+                  "parts": [
+                    {
+                      "text": "Transaction TXN-20260312-0015811 contains 1x Oppo Enco Air 2 Pro Bluetooth Wireless Earbuds ($43.99) and 1x Apple Watch Magnetic Charging Cable ($36.99)."
+                    }
+                  ]
+                }
+              },
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Is the Oppo Enco Air 2 Pro covered under our standard return and warranty policy if it was purchased 45 days ago?"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "eval_multiturn_context_switching_hardware_to_inventory",
+      "description": "Multi-turn evaluation: Intent switching from POS printer error recovery to store on-hand inventory position.",
+      "agent_data": {
+        "turns": [
+          {
+            "turn_index": 0,
+            "events": [
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "The POS printer at station 2 is showing error ERR-DN-PRNT-24V. What should the cashier do?"
+                    }
+                  ]
+                }
+              },
+              {
+                "author": "agent",
+                "content": {
+                  "role": "model",
+                  "parts": [
+                    {
+                      "text": "For ERR-DN-PRNT-24V on Diebold Nixdorf printers: Turn off printer power, release the green cutter lever manually to unjam receipt paper, check 24V cable seating, and power on."
+                    }
+                  ]
+                }
+              },
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Now check if Store 48 has replacement receipt paper rolls in on-hand inventory."
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

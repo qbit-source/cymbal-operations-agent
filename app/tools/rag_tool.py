@@ -19,9 +19,7 @@ CHUNK_TABLE = f"{PROJECT_ID}.{DATASET_ID}.pos_manual_chunk_embeddings"
 SIMILARITY_THRESHOLD = 0.70
 
 MANDATORY_DECLINE_STRING = (
-    "The requested issue falls outside certified POS equipment manuals (relevance score < 0.70). "
-    "No certified technical runbook was found for this query. "
-    "Please consult store operations or verified technical documentation."
+    "I cannot find certified warranty or repair rules for this specific error in our technical repository."
 )
 
 
