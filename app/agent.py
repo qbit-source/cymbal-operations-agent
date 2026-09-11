@@ -118,6 +118,7 @@ cymbal_operations_agent = Agent(
     tools=[
         cymbal_analytics_tool,
         pos_troubleshooting_rag_tool,
+        bigtable_mcp_toolset,
         bigtable_realtime_alerts_tool,
         bigtable_enriched_sql_tool,
     ],

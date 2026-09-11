@@ -1,7 +1,10 @@
 """Bigtable MCP Toolset and Analytical Connectors for Cymbal Operations Agent.
 
-Queries Cloud Bigtable instance 'operations-db' via deployed MCP Toolbox microservice on Cloud Run,
-Bigtable GoogleSQL query executor, and direct SDK row set fallback.
+Queries Cloud Bigtable instance 'operations-db' via:
+1. Native ADK McpToolset integration targeting the deployed Cloud Run MCP Toolbox microservice,
+   authenticated programmatically with google.oauth2.id_token / impersonated credentials (no gcloud CLI).
+2. Bigtable GoogleSQL query executor for 'pos_transactions_enriched'.
+3. Direct Bigtable SDK row set fallback with binary metric decoding.
 """
 
 import base64
@@ -9,11 +12,16 @@ import json
 import logging
 import os
 import struct
-import subprocess
 from typing import Any, Dict, List, Optional
 
+import google.auth
+from google.auth import impersonated_credentials
+import google.auth.transport.requests
+from google.oauth2 import id_token
 from dotenv import load_dotenv
+
 from google.adk.tools import FunctionTool
+from google.adk.tools.mcp_tool import McpToolset, StreamableHTTPConnectionParams
 from google.cloud import bigtable
 from google.cloud.bigtable.data import BigtableDataClient
 from google.cloud.bigtable.row_set import RowSet
@@ -43,6 +51,34 @@ def _get_bigtable_table(table_name: str = BIGTABLE_TABLE_ID):
         _bigtable_client = bigtable.Client(project=PROJECT_ID)
     instance = _bigtable_client.instance(BIGTABLE_INSTANCE_ID)
     return instance.table(table_name)
+
+
+def _get_oidc_token(audience: str) -> Optional[str]:
+    """Generates GCP OIDC identity token programmatically without system-level gcloud CLI."""
+    try:
+        base_creds, _ = google.auth.default()
+        auth_req = google.auth.transport.requests.Request()
+
+        if SERVICE_ACCOUNT:
+            try:
+                target_creds = impersonated_credentials.IDTokenCredentials(
+                    target_credentials=impersonated_credentials.Credentials(
+                        source_credentials=base_creds,
+                        target_principal=SERVICE_ACCOUNT,
+                        target_scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                    ),
+                    target_audience=audience,
+                    include_email=True,
+                )
+                target_creds.refresh(auth_req)
+                return target_creds.token
+            except Exception as imp_err:
+                logger.debug(f"Service account impersonation fallback to direct ID token: {imp_err}")
+
+        return id_token.fetch_id_token(auth_req, audience)
+    except Exception as e:
+        logger.warning(f"Programmatic OIDC token generation failed: {e}")
+        return None
 
 
 def _decode_metric_bytes(col_name: str, raw_bytes: bytes) -> Any:
@@ -92,88 +128,26 @@ def _query_bigtable_direct(prefix: str, limit: int = 5) -> List[Dict[str, Any]]:
     return results
 
 
-def _get_oidc_token(audience: str) -> Optional[str]:
-    """Generates GCP OIDC identity token for target audience."""
-    try:
-        cmd = ["gcloud", "auth", "print-identity-token"]
-        if SERVICE_ACCOUNT:
-            cmd.append(f"--impersonate-service-account={SERVICE_ACCOUNT}")
-        cmd.append(f"--audiences={audience}")
-        token = subprocess.check_output(
-            cmd,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=10,
-        ).strip().splitlines()[-1]
-        return token
-    except Exception as e:
-        logger.warning(f"Failed to get impersonated token, falling back to direct token: {e}")
-        try:
-            return subprocess.check_output(
-                ["gcloud", "auth", "print-identity-token"],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=10,
-            ).strip().splitlines()[-1]
-        except Exception:
-            return None
+def _build_mcp_toolset() -> McpToolset:
+    """Builds the native ADK McpToolset connecting to the Cloud Run MCP Toolbox service."""
+    base_url = BIGTABLE_MCP_URL.rstrip("/")
+    mcp_endpoint = f"{base_url}/mcp"
+    token = _get_oidc_token(base_url)
 
-
-def _query_mcp_service(prefix: str) -> List[Dict[str, Any]]:
-    """Calls Cloud Run MCP Toolbox microservice over HTTP JSON-RPC."""
-    import urllib.request
-
-    target_url = BIGTABLE_MCP_URL.rstrip("/")
-    mcp_endpoint = f"{target_url}/mcp"
-    token = _get_oidc_token(target_url)
-
-    headers = {
-        "Content-Type": "application/json",
-    }
+    headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    req_payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "get_cashier_realtime_alerts",
-            "arguments": {"prefix": f"{prefix}%"},
-        },
-    }
-
-    req = urllib.request.Request(
-        mcp_endpoint,
-        data=json.dumps(req_payload).encode("utf-8"),
+    conn_params = StreamableHTTPConnectionParams(
+        url=mcp_endpoint,
         headers=headers,
-        method="POST",
+        timeout=15.0,
     )
+    return McpToolset(connection_params=conn_params)
 
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
-        if body.get("result", {}).get("isError"):
-            raise RuntimeError(f"MCP error: {body['result']}")
 
-        content = body.get("result", {}).get("content", [])
-        decoded_rows = []
-        for item in content:
-            if item.get("type") == "text":
-                row_raw = json.loads(item["text"])
-                row_decoded: Dict[str, Any] = {"row_key": row_raw.get("row_key")}
-                for k, v in row_raw.items():
-                    if k == "row_key":
-                        continue
-                    if isinstance(v, str):
-                        try:
-                            raw_b = base64.b64decode(v)
-                            row_decoded[k] = _decode_metric_bytes(k, raw_b)
-                        except Exception:
-                            row_decoded[k] = v
-                    else:
-                        row_decoded[k] = v
-                decoded_rows.append(row_decoded)
-        return decoded_rows
+# Native ADK McpToolset instance for Bigtable operational metrics
+bigtable_mcp_toolset = _build_mcp_toolset()
 
 
 def query_cashier_realtime_alerts(
@@ -202,12 +176,51 @@ def query_cashier_realtime_alerts(
     row_key_prefix = f"{norm_store}#{clean_cashier}"
 
     try:
+        import urllib.request
+        target_url = BIGTABLE_MCP_URL.rstrip("/")
+        token = _get_oidc_token(target_url)
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        req_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "get_cashier_realtime_alerts",
+                "arguments": {"prefix": f"{row_key_prefix}%"},
+            },
+        }
+        req = urllib.request.Request(
+            f"{target_url}/mcp",
+            data=json.dumps(req_payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        rows: List[Dict[str, Any]] = []
         try:
-            rows = _query_mcp_service(row_key_prefix)
-            if not rows:
-                rows = _query_bigtable_direct(row_key_prefix)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                content = body.get("result", {}).get("content", [])
+                for item in content:
+                    if item.get("type") == "text":
+                        row_raw = json.loads(item["text"])
+                        row_decoded: Dict[str, Any] = {"row_key": row_raw.get("row_key")}
+                        for k, v in row_raw.items():
+                            if k == "row_key":
+                                continue
+                            if isinstance(v, str):
+                                try:
+                                    raw_b = base64.b64decode(v)
+                                    row_decoded[k] = _decode_metric_bytes(k, raw_b)
+                                except Exception:
+                                    row_decoded[k] = v
+                            else:
+                                row_decoded[k] = v
+                        rows.append(row_decoded)
         except Exception as mcp_err:
-            logger.warning(f"MCP service call failed ({mcp_err}), falling back to direct Bigtable query.")
+            logger.warning(f"MCP direct HTTP call failed ({mcp_err}), falling back to direct Bigtable SDK: {mcp_err}")
             rows = _query_bigtable_direct(row_key_prefix)
 
         if not rows:
@@ -294,7 +307,6 @@ def read_pos_transactions_enriched_sql(
 
     records: List[Dict[str, Any]] = []
 
-    # Attempt 1: Bigtable Data Client with GoogleSQL execute_query
     try:
         with BigtableDataClient(project=PROJECT_ID) as client:
             res = client.execute_query(
@@ -366,4 +378,3 @@ def read_pos_transactions_enriched_sql(
 
 bigtable_realtime_alerts_tool = FunctionTool(query_cashier_realtime_alerts)
 bigtable_enriched_sql_tool = FunctionTool(read_pos_transactions_enriched_sql)
-bigtable_mcp_toolset = bigtable_realtime_alerts_tool
