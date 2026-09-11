@@ -1,0 +1,29 @@
+kind: source
+name: bigtable-operations
+type: bigtable
+project: project-elevate-503005
+instance: operations-db
+---
+kind: tool
+name: get_cashier_realtime_alerts
+type: bigtable-sql
+source: bigtable-operations
+description: "Read live 1-hour rolling metrics and audit status flags for a cashier from Cloud Bigtable"
+statement: |
+  SELECT
+    CAST(_key AS STRING) as row_key,
+    flags['audit_status'] as audit_status,
+    stats['last_event_ts'] as last_event_ts,
+    stats['cashier_1h_txn_count'] as cashier_1h_txn_count,
+    stats['cashier_1h_manual_override_count'] as cashier_1h_manual_override_count,
+    stats['cashier_1h_promo_count'] as cashier_1h_promo_count,
+    stats['cashier_1h_avg_discount_pct'] as cashier_1h_avg_discount_pct,
+    stats['cashier_1h_promo_rate'] as cashier_1h_promo_rate,
+    stats['cashier_1h_total_discount_usd'] as cashier_1h_total_discount_usd,
+    stats['risk_score'] as risk_score
+  FROM cashier_realtime_alerts
+  WHERE CAST(_key AS STRING) LIKE @prefix
+parameters:
+  - name: prefix
+    type: string
+    description: "Row key prefix to search for, e.g. STORE_048#CASH_1190%"
